@@ -15,21 +15,29 @@ governing permissions and limitations under the License.
 
 const { HttpsProxyAgent } = require("https-proxy-agent")
 const axios = require('axios');
-const util = require('util'); 
+const util = require('util');
 const qs = require('qs');
 var jwt = require('jsonwebtoken');
 
 // base client lib with interceptors for requests to add logging.
 class IMSJWTTokenExchange {
-    constructor(host, proxy) {
-        if ( host === undefined ) {
+    constructor(host, proxy, gateway) {
+        if (host === undefined) {
             throw new Error("Client lib must have a target host defined, imsHost or jilHost");
         }
         this.host = host
+        this.gateway = undefined
         if (proxy) {
-            var httpsAgent = new HttpsProxyAgent({host: proxy.host, port: proxy.port});
+            var httpsAgent = new HttpsProxyAgent({ host: proxy.host, port: proxy.port });
             this.request = axios.create({
                 baseURL: `https://${this.host}`,
+                timeout: 10000,
+                httpsAgent
+            });
+        } else if (gateway) {
+            this.gateway = gateway.host
+            this.request = axios.create({
+                baseURL: `https://${this.gateway}`,
                 timeout: 10000,
                 httpsAgent
             });
@@ -43,40 +51,40 @@ class IMSJWTTokenExchange {
 
         this.request.interceptors.request.use(function (config) {
             console.debug(`>> ${config.method} ${config.url}`);
-            if ( config.verbose ) {
-                console.debug(JSON.stringify(config,null,2)); 
+            if (config.verbose) {
+                console.debug(JSON.stringify(config, null, 2));
             }
             // Do something before request is sent
             return config;
-          }, function (error) {
+        }, function (error) {
             console.error(`Failed making request ${error.message}`);
             // Do something with request error
             return Promise.reject(error);
-          });
+        });
 
         this.request.interceptors.response.use(function (response) {
             // Do something with response data
             console.debug(`<< ${response.config.method} ${response.config.url} ${response.status}`);
-            if ( response.config.verbose ) {
-                console.debug(util.inspect(response.data)); 
+            if (response.config.verbose) {
+                console.debug(util.inspect(response.data));
             }
             return response;
-          }, function (error) {
+        }, function (error) {
             // Do something with response error
-            if ( error.config ) {
+            if (error.config) {
                 console.error(`Error performing operation ${error.message} request ${error.config.url}`);
             } else {
                 console.error(`Error performing operation ${error.message} request (no config)`);
             }
-            if ( error.response ) {
+            if (error.response) {
                 console.error(util.inspect(error.response.data));
             }
             return Promise.reject(error);
-          });
+        });
     }
 
     checkRequired(options, key) {
-        if ( options[key] === undefined ) {
+        if (options[key] === undefined) {
             throw new Error(`${key} is a required option.`);
         }
     }
@@ -109,7 +117,7 @@ class IMSJWTTokenExchange {
     *       The private key associated with the certificate bound to the technical account.
     * } options
     */
-   async exchangeJwt(options) {
+    async exchangeJwt(options) {
         this.checkRequired(options, "issuer");
         this.checkRequired(options, "subject");
         this.checkRequired(options, "expiration_time_seconds");
@@ -129,24 +137,35 @@ class IMSJWTTokenExchange {
         });
 
         // sign with RSA256.
-        var jwt_token = jwt.sign(jwt_payload, options.privateKey, { algorithm: 'RS256'});
+        var jwt_token = jwt.sign(jwt_payload, options.privateKey, { algorithm: 'RS256' });
 
-        if ( options.publicKey ) {
-            console.debug(jwt.verify(jwt_token, options.publicKey,{ complete: true}));
+        if (options.publicKey) {
+            console.debug(jwt.verify(jwt_token, options.publicKey, { complete: true }));
         }
 
 
         var body = qs.stringify({
-                client_id: options.client_id,
-                client_secret: options.client_secret,
-                jwt_token: jwt_token    
-            });
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            jwt_token: jwt_token
+        });
         var config = {
             headers: { 'content-type': 'application/x-www-form-urlencoded' },
             verbose: options.verbose
         };
-        var response = await this.request.post(`/ims/exchange/jwt`,body, config);
-        if ( response.status === 200) {
+        var response = undefined;
+        var body = qs.stringify({
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            jwt_token: jwt_token
+        });
+        if (this.gateway) {
+            response = await this.request.post(this.gateway.url, body, config);
+        } else {
+            response = await this.request.post(`/ims/exchange/jwt`, body, config);
+        }
+
+        if (response.status === 200) {
             return response.data;
         }
         throw Error("Failed to exchange jwt.")
@@ -157,8 +176,8 @@ class IMSJWTTokenExchange {
 var assertPresent = (config, path, missing) => {
     const pathElements = path.split(".");
     var c = config;
-    for(var p of pathElements) {
-        if ( !c[p] ) {
+    for (var p of pathElements) {
+        if (!c[p]) {
             missing.push(path);
             return;
         }
@@ -168,36 +187,38 @@ var assertPresent = (config, path, missing) => {
 
 
 module.exports = async (integrationConfig) => {
-        var jwtExchange = undefined;
-        if (integrationConfig.proxy) {
-            jwtExchange = new IMSJWTTokenExchange(integrationConfig.integration.imsEndpoint, integrationConfig.proxy);
-        } else {
-            jwtExchange = new IMSJWTTokenExchange(integrationConfig.integration.imsEndpoint);
-        }
-        
-        var missing = [];
-        assertPresent(integrationConfig, "integration.org", missing);
-        assertPresent(integrationConfig, "integration.id", missing);
-        assertPresent(integrationConfig, "integration.technicalAccount.clientId", missing);
-        assertPresent(integrationConfig, "integration.technicalAccount.clientSecret", missing);
-        assertPresent(integrationConfig, "integration.metascopes", missing);
-        assertPresent(integrationConfig, "integration.privateKey", missing);
-        assertPresent(integrationConfig, "integration.publicKey", missing);
-        if ( missing.length > 0 ) {
-            throw new Error("The following configuration elements are missing ",missing.join(","));
-        }
-        console.log(integrationConfig.integration.privateKey)
-        console.log(integrationConfig.integration.publicKey)
-		return await jwtExchange.exchangeJwt({
-				issuer: `${integrationConfig.integration.org}`,
-				subject: `${integrationConfig.integration.id}`, 
-				expiration_time_seconds: Math.floor((Date.now()/1000)+3600*8),
-				metascope: integrationConfig.integration.metascopes.split(","),
-				client_id: integrationConfig.integration.technicalAccount.clientId,
-				client_secret: integrationConfig.integration.technicalAccount.clientSecret,
-				privateKey: integrationConfig.integration.privateKey,
-				publicKey: integrationConfig.integration.publicKey
-			});
+    var jwtExchange = undefined;
+    if (integrationConfig.gateway) {
+        jwtExchange = new IMSJWTTokenExchange(integrationConfig.integration.imsEndpoint, undefined, integrationConfig.gateway);
+    } else if (integrationConfig.proxy) {
+        jwtExchange = new IMSJWTTokenExchange(integrationConfig.integration.imsEndpoint, integrationConfig.proxy, undefined);
+    } else {
+        jwtExchange = new IMSJWTTokenExchange(integrationConfig.integration.imsEndpoint, undefined, undefined);
+    }
+
+    var missing = [];
+    assertPresent(integrationConfig, "integration.org", missing);
+    assertPresent(integrationConfig, "integration.id", missing);
+    assertPresent(integrationConfig, "integration.technicalAccount.clientId", missing);
+    assertPresent(integrationConfig, "integration.technicalAccount.clientSecret", missing);
+    assertPresent(integrationConfig, "integration.metascopes", missing);
+    assertPresent(integrationConfig, "integration.privateKey", missing);
+    assertPresent(integrationConfig, "integration.publicKey", missing);
+    if (missing.length > 0) {
+        throw new Error("The following configuration elements are missing ", missing.join(","));
+    }
+    console.log(integrationConfig.integration.privateKey)
+    console.log(integrationConfig.integration.publicKey)
+    return await jwtExchange.exchangeJwt({
+        issuer: `${integrationConfig.integration.org}`,
+        subject: `${integrationConfig.integration.id}`,
+        expiration_time_seconds: Math.floor((Date.now() / 1000) + 3600 * 8),
+        metascope: integrationConfig.integration.metascopes.split(","),
+        client_id: integrationConfig.integration.technicalAccount.clientId,
+        client_secret: integrationConfig.integration.technicalAccount.clientSecret,
+        privateKey: integrationConfig.integration.privateKey,
+        publicKey: integrationConfig.integration.publicKey
+    });
 };
 
 
